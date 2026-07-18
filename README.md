@@ -8,7 +8,7 @@
 - 🎵 支援 MP3、WAV、M4A，上傳上限 200MB（>15MB 自動改走 Gemini Files API）
 - 🗣️ 說話者識別（Speaker Diarization）：依出場順序標記說話者 A / B / C…，並以顏色區分
 - ⏱️ 每段發言附開始時間戳記 `[MM:SS]`
-- 🔄 可切換模型：`gemini-3.5-flash`（推薦）/ `gemini-flash-lite-latest`（更省・品質略降）
+- 🔄 可切換模型：`gemini-3.5-flash`（推薦）/ `gemini-3-flash-preview`（備用・上一代 flash，品質相當）
 - ✂️ 自動靜音裁剪（預設開啟）：Gemini 依音訊秒數計費，剪掉超過 1 秒的靜音段可省 2 成以上費用；需精準對回原始錄音時間時可於側欄關閉
 - 🗣️ 支援國語、台語、英語混講（台語自動轉寫為繁體中文書面文字）
 - ⬇️ 一鍵下載逐字稿 `.txt`

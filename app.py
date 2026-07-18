@@ -16,7 +16,7 @@ from google.genai import types
 # ── 常數設定 ──────────────────────────────────────────────
 MODELS = {
     "gemini-3.5-flash（推薦）": "gemini-3.5-flash",
-    "gemini-flash-lite-latest（更省・品質略降）": "gemini-flash-lite-latest",
+    "gemini-3-flash-preview（備用・上一代 flash）": "gemini-3-flash-preview",
 }
 
 MIME_MAP = {
