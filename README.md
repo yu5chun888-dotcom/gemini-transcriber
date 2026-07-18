@@ -8,7 +8,8 @@
 - 🎵 支援 MP3、WAV、M4A，上傳上限 200MB（>15MB 自動改走 Gemini Files API）
 - 🗣️ 說話者識別（Speaker Diarization）：依出場順序標記說話者 A / B / C…，並以顏色區分
 - ⏱️ 每段發言附開始時間戳記 `[MM:SS]`
-- 🔄 可切換模型：`gemini-3.5-flash`（快速）/ `gemini-pro-latest`（高品質）
+- 🔄 可切換模型：`gemini-3.5-flash`（推薦）/ `gemini-flash-lite-latest`（更省・品質略降）
+- ✂️ 自動靜音裁剪（預設開啟）：Gemini 依音訊秒數計費，剪掉超過 1 秒的靜音段可省 2 成以上費用；需精準對回原始錄音時間時可於側欄關閉
 - 🗣️ 支援國語、台語、英語混講（台語自動轉寫為繁體中文書面文字）
 - ⬇️ 一鍵下載逐字稿 `.txt`
 
@@ -81,5 +82,5 @@ gemini-transcriber/
 - **時間戳記準嗎？** Gemini 對音訊時間的估計大致準確，但長音訊可能有數秒偏移，重要場合請抽查核對。
 - **說話者會認錯嗎？** 聲音相近或重疊發言時可能混淆，建議轉完後人工快速校對說話者代號。
 - **音訊長度上限？** Gemini 單一請求最長支援約 9.5 小時音訊；實務上建議 2 小時內、並注意 API 免費額度。
-- **費用？** Gemini API 有免費額度；超過後 flash 系列模型的音訊轉錄成本約每小時音訊數美元內，詳見 [官方定價](https://ai.google.dev/pricing)。
+- **費用？** Gemini 依音訊「秒數」計費（與檔案大小、音質無關），flash 級約 NT$4–6／小時音訊。省錢三招：開啟靜音裁剪（預設開）、長檔改選 flash-lite、避免不必要的重轉。建議在 Google Cloud Console 設預算警示。詳見 [官方定價](https://ai.google.dev/pricing)。
 - **模型清單會變動嗎？** 會。若遇到「model no longer available」錯誤，執行 `python -c "from google import genai; [print(m.name) for m in genai.Client(api_key='你的Key').models.list()]"` 查詢可用模型，並更新 `app.py` 開頭的 `MODELS` 字典。

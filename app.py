@@ -3,6 +3,10 @@
 
 import io
 import os
+import re
+import shutil
+import subprocess
+import tempfile
 import time
 
 import streamlit as st
@@ -11,8 +15,8 @@ from google.genai import types
 
 # ── 常數設定 ──────────────────────────────────────────────
 MODELS = {
-    "gemini-3.5-flash（快速・推薦）": "gemini-3.5-flash",
-    "gemini-pro-latest（高品質・較慢）": "gemini-pro-latest",
+    "gemini-3.5-flash（推薦）": "gemini-3.5-flash",
+    "gemini-flash-lite-latest（更省・品質略降）": "gemini-flash-lite-latest",
 }
 
 MIME_MAP = {
@@ -32,6 +36,63 @@ TRANSCRIBE_PROMPT = """你是專業的逐字稿聽打員。請將這段音訊完
 4. 逐字稿使用繁體中文。若說話者使用台語（台灣閩南語），請轉寫為語意對應的繁體中文書面文字，必要時可在括號內附註台語原詞；英文或專有名詞保留原文。
 5. 只輸出逐字稿本身，不要加任何前言、說明、標題或總結。
 """
+
+
+# ── 靜音裁剪（省費用：Gemini 依音訊「秒數」計費，與檔案大小無關）──
+def get_ffmpeg_path() -> str | None:
+    path = shutil.which("ffmpeg")
+    if path:
+        return path
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def probe_duration(ffmpeg: str, path: str) -> float | None:
+    """從 ffmpeg 輸出解析音訊長度（秒）。"""
+    result = subprocess.run([ffmpeg, "-i", path], capture_output=True, text=True,
+                            encoding="utf-8", errors="replace")
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", result.stderr or "")
+    if not m:
+        return None
+    h, mnt, s = m.groups()
+    return int(h) * 3600 + int(mnt) * 60 + float(s)
+
+
+def trim_silence(data: bytes, ext: str) -> tuple[bytes, str, float, float] | None:
+    """移除超過 1 秒的靜音段並轉單聲道 mp3。
+
+    回傳 (新資料, 新mime, 原長度秒, 新長度秒)；無 ffmpeg 或處理失敗時回傳 None。
+    """
+    ffmpeg = get_ffmpeg_path()
+    if not ffmpeg:
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, f"in.{ext}")
+            dst = os.path.join(td, "out.mp3")
+            with open(src, "wb") as f:
+                f.write(data)
+            orig = probe_duration(ffmpeg, src)
+            result = subprocess.run(
+                [ffmpeg, "-y", "-i", src,
+                 "-af", "silenceremove=start_periods=1:start_duration=0:start_threshold=-38dB:"
+                        "stop_periods=-1:stop_duration=1.0:stop_threshold=-38dB",
+                 "-ac", "1", "-b:a", "64k", dst],
+                capture_output=True, timeout=1800,
+            )
+            if result.returncode != 0 or not os.path.exists(dst):
+                return None
+            new = probe_duration(ffmpeg, dst)
+            if orig is None or new is None or new <= 0:
+                return None
+            with open(dst, "rb") as f:
+                out = f.read()
+        return out, "audio/mp3", orig, new
+    except Exception:
+        return None
 
 
 # ── 工具函式 ──────────────────────────────────────────────
@@ -91,6 +152,14 @@ with st.sidebar:
     model_label = st.selectbox("選擇模型", list(MODELS.keys()), index=0)
     model = MODELS[model_label]
 
+    trim_enabled = st.checkbox(
+        "上傳前自動裁剪靜音（省費用）",
+        value=True,
+        help="Gemini 依音訊秒數計費，與檔案大小無關。自動剪掉超過 1 秒的靜音段，"
+             "長錄音通常可省 2 成以上費用。注意：裁剪後時間戳記是裁剪版音訊的時間，"
+             "與原始錄音會有偏移；需要精準對回原檔時請關閉此選項。",
+    )
+
     api_key = get_api_key()
     if api_key:
         st.success("已從環境設定讀到 GEMINI_API_KEY ✅")
@@ -127,10 +196,24 @@ if uploaded_file is not None:
 
         ext = uploaded_file.name.rsplit(".", 1)[-1].lower()
         mime_type = MIME_MAP.get(ext, "audio/mp3")
+        audio_bytes = uploaded_file.getvalue()
+
+        if trim_enabled:
+            with st.spinner("靜音裁剪中……"):
+                trimmed = trim_silence(audio_bytes, ext)
+            if trimmed:
+                audio_bytes, mime_type, orig_sec, new_sec = trimmed
+                saved_pct = max(0.0, (1 - new_sec / orig_sec) * 100) if orig_sec else 0.0
+                st.info(
+                    f"✂️ 已裁剪靜音：{orig_sec / 60:.1f} 分 → {new_sec / 60:.1f} 分"
+                    f"（費用約省 {saved_pct:.0f}%）"
+                )
+            else:
+                st.caption("（未進行靜音裁剪：ffmpeg 不可用或處理失敗，改用原始音訊）")
 
         with st.spinner("AI 轉錄中……音訊越長耗時越久（10 分鐘錄音約需 1–3 分鐘），請勿關閉頁面。"):
             try:
-                transcript = transcribe(api_key, model, uploaded_file.getvalue(), mime_type)
+                transcript = transcribe(api_key, model, audio_bytes, mime_type)
             except Exception as e:
                 st.error(f"轉錄失敗：{e}")
                 st.stop()
