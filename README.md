@@ -10,6 +10,7 @@
 - ⏱️ 每段發言附開始時間戳記 `[MM:SS]`
 - 🤖 可切換模型：`gemini-3.6-flash`（最新）/ `gemini-3.5-flash`（穩定），兩者皆經實測，說話者識別與中英台混講品質良好
 - ✂️ 自動靜音裁剪（預設開啟）：Gemini 依音訊秒數計費，剪掉超過 1 秒的靜音段可省 2 成以上費用；需精準對回原始錄音時間時可於側欄關閉
+- 💰 用量與費用顯示：每次轉錄後顯示輸入／輸出 token 數與估算費用（NT$），並累計本次開啟頁面的總花費
 - 🗣️ 支援國語、台語、英語混講（台語自動轉寫為繁體中文書面文字）
 - ⬇️ 一鍵下載逐字稿 `.txt`
 
@@ -82,5 +83,7 @@ gemini-transcriber/
 - **時間戳記準嗎？** Gemini 對音訊時間的估計大致準確，但長音訊可能有數秒偏移，重要場合請抽查核對。
 - **說話者會認錯嗎？** 聲音相近或重疊發言時可能混淆，建議轉完後人工快速校對說話者代號。
 - **音訊長度上限？** Gemini 單一請求最長支援約 9.5 小時音訊；實務上建議 2 小時內、並注意 API 免費額度。
-- **費用？** Gemini 依音訊「秒數」計費（與檔案大小、音質無關），flash 級約 NT$4–6／小時音訊。省錢三招：開啟靜音裁剪（預設開）、長檔改選 flash-lite、避免不必要的重轉。建議在 Google Cloud Console 設預算警示。詳見 [官方定價](https://ai.google.dev/pricing)。
+- **費用？** Gemini 依音訊「秒數」計費（與檔案大小、音質無關，實測約每秒 25 tokens），**一小時錄音約 NT$8–10**（含輸出與思考 token）。省錢方式：保持靜音裁剪開啟、避免重複轉同一個檔。建議在 Google Cloud Console 設預算警示。詳見 [官方定價](https://ai.google.dev/gemini-api/docs/pricing)。
+- **畫面顯示的費用準嗎？** 是依官方單價即時換算的**估算值**（匯率固定為 1 美元 = 32 元），與 Google 實際帳單通常有小幅落差（免費額度、計價捨入等因素）。正式對帳請看 Google Cloud Console。
+- **Google 調價了怎麼辦？** 修改 `app.py` 開頭的 `PRICING_USD_PER_1M` 與 `USD_TO_TWD` 即可，該處有註記價格來源與最後查核日期。
 - **模型清單會變動嗎？** 會。若遇到「model no longer available」錯誤，執行 `python -c "from google import genai; [print(m.name) for m in genai.Client(api_key='你的Key').models.list()]"` 查詢可用模型，並更新 `app.py` 開頭的 `MODELS` 字典。

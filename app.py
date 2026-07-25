@@ -27,6 +27,18 @@ MIME_MAP = {
 
 INLINE_LIMIT_MB = 15  # 超過此大小改走 Files API（Gemini 單次請求上限 20MB）
 
+# ── 計費參數 ──────────────────────────────────────────────
+# 單價（美元／百萬 token），來源：https://ai.google.dev/gemini-api/docs/pricing
+# ⚠️ Google 調價或新增模型時，這張表要一併更新，否則畫面金額會失準。
+# 最後查核日期：2026-07-25
+PRICING_USD_PER_1M = {
+    "gemini-3.6-flash": {"input": 1.50, "output": 7.50},
+    "gemini-3.5-flash": {"input": 1.50, "output": 9.00},
+}
+
+USD_TO_TWD = 32.0          # 概略匯率，供快速換算參考
+AUDIO_TOKENS_PER_SEC = 25  # 實測值：5 秒音訊 = 125 tokens
+
 TRANSCRIBE_PROMPT = """你是專業的逐字稿聽打員。請將這段音訊完整轉錄為逐字稿，並區分不同說話者（Speaker Diarization）。
 
 輸出規則（務必嚴格遵守）：
@@ -120,8 +132,40 @@ def wait_until_active(client: genai.Client, file, timeout_sec: int = 300):
     return file
 
 
-def transcribe(api_key: str, model: str, data: bytes, mime_type: str) -> str:
-    """呼叫 Gemini API 進行轉錄與說話者識別，回傳逐字稿文字。"""
+def extract_usage(response, model: str) -> dict:
+    """從 API 回應取出 token 用量並換算費用（估算值，非帳單）。"""
+    u = getattr(response, "usage_metadata", None)
+    prompt = int(getattr(u, "prompt_token_count", 0) or 0)
+    candidates = int(getattr(u, "candidates_token_count", 0) or 0)
+    thoughts = int(getattr(u, "thoughts_token_count", 0) or 0)
+    output = candidates + thoughts  # 思考 token 一樣以輸出計價
+
+    audio = 0
+    for detail in (getattr(u, "prompt_tokens_details", None) or []):
+        modality = getattr(getattr(detail, "modality", None), "name", "")
+        if modality == "AUDIO":
+            audio += int(getattr(detail, "token_count", 0) or 0)
+
+    price = PRICING_USD_PER_1M.get(model)
+    usd = None
+    if price:
+        usd = prompt / 1e6 * price["input"] + output / 1e6 * price["output"]
+
+    return {
+        "input_tokens": prompt,
+        "output_tokens": output,
+        "thoughts_tokens": thoughts,
+        "audio_tokens": audio,
+        "usd": usd,
+        "model": model,
+    }
+
+
+def transcribe(api_key: str, model: str, data: bytes, mime_type: str) -> tuple[str, dict]:
+    """呼叫 Gemini API 進行轉錄與說話者識別。
+
+    回傳 (逐字稿文字, 用量與費用估算)。
+    """
     client = genai.Client(api_key=api_key)
 
     size_mb = len(data) / (1024 * 1024)
@@ -138,7 +182,7 @@ def transcribe(api_key: str, model: str, data: bytes, mime_type: str) -> str:
         contents = [TRANSCRIBE_PROMPT, uploaded]
 
     response = client.models.generate_content(model=model, contents=contents)
-    return (response.text or "").strip()
+    return (response.text or "").strip(), extract_usage(response, model)
 
 
 # ── 頁面 ──────────────────────────────────────────────────
@@ -204,16 +248,20 @@ if uploaded_file is not None:
             if trimmed:
                 audio_bytes, mime_type, orig_sec, new_sec = trimmed
                 saved_pct = max(0.0, (1 - new_sec / orig_sec) * 100) if orig_sec else 0.0
-                st.info(
-                    f"✂️ 已裁剪靜音：{orig_sec / 60:.1f} 分 → {new_sec / 60:.1f} 分"
-                    f"（費用約省 {saved_pct:.0f}%）"
-                )
+                msg = (f"✂️ 已裁剪靜音：{orig_sec / 60:.1f} 分 → {new_sec / 60:.1f} 分"
+                       f"（省 {saved_pct:.0f}%）")
+                price = PRICING_USD_PER_1M.get(model)
+                if price:
+                    saved_usd = (max(0.0, orig_sec - new_sec) * AUDIO_TOKENS_PER_SEC
+                                 / 1e6 * price["input"])
+                    msg += f"，約省 NT${saved_usd * USD_TO_TWD:.2f}"
+                st.info(msg)
             else:
                 st.caption("（未進行靜音裁剪：ffmpeg 不可用或處理失敗，改用原始音訊）")
 
         with st.spinner("AI 轉錄中……音訊越長耗時越久（10 分鐘錄音約需 1–3 分鐘），請勿關閉頁面。"):
             try:
-                transcript = transcribe(api_key, model, audio_bytes, mime_type)
+                transcript, usage = transcribe(api_key, model, audio_bytes, mime_type)
             except Exception as e:
                 st.error(f"轉錄失敗：{e}")
                 st.stop()
@@ -224,11 +272,38 @@ if uploaded_file is not None:
 
         st.session_state["transcript"] = transcript
         st.session_state["transcript_name"] = uploaded_file.name
+        st.session_state["usage"] = usage
+        if usage.get("usd") is not None:
+            st.session_state["session_usd"] = (
+                st.session_state.get("session_usd", 0.0) + usage["usd"]
+            )
+            st.session_state["session_runs"] = st.session_state.get("session_runs", 0) + 1
 
 # 顯示結果（存在 session_state，避免下載按鈕觸發重跑後結果消失）
 if "transcript" in st.session_state:
     st.divider()
     st.subheader(f"📝 逐字稿：{st.session_state['transcript_name']}")
+
+    usage = st.session_state.get("usage")
+    if usage:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("音訊長度", f"{usage['audio_tokens'] / AUDIO_TOKENS_PER_SEC / 60:.1f} 分")
+        c2.metric("輸入 tokens", f"{usage['input_tokens']:,}")
+        c3.metric("輸出 tokens", f"{usage['output_tokens']:,}",
+                  help=f"含思考 token {usage['thoughts_tokens']:,}（一樣以輸出計價）")
+        if usage.get("usd") is not None:
+            c4.metric("本次費用", f"NT${usage['usd'] * USD_TO_TWD:.2f}",
+                      help=f"US${usage['usd']:.4f}｜模型 {usage['model']}")
+        else:
+            c4.metric("本次費用", "—", help=f"{usage['model']} 尚未列入程式內的價目表")
+
+        note = (f"💡 費用為估算值（依官方單價換算，匯率以 1 美元 = {USD_TO_TWD:.0f} 元計），"
+                "與 Google 實際帳單可能有小幅落差；正式對帳請看 Google Cloud Console。")
+        if st.session_state.get("session_runs", 0) > 1:
+            note += (f" 本次開啟頁面已轉錄 {st.session_state['session_runs']} 次，"
+                     f"累計約 NT${st.session_state['session_usd'] * USD_TO_TWD:.2f}"
+                     "（重新整理頁面即歸零）。")
+        st.caption(note)
 
     base_name = st.session_state["transcript_name"].rsplit(".", 1)[0]
     st.download_button(

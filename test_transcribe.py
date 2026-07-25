@@ -42,8 +42,10 @@ def main():
         data = f.read()
 
     print(f"▶ 測試檔案：{audio_path}（{len(data)/1024:.0f} KB, {mime}）")
-    print("▶ 呼叫 gemini-3.5-flash 轉錄中……")
-    transcript = transcribe(key, "gemini-3.5-flash", data, mime)
+    print("▶ 呼叫 gemini-3.6-flash 轉錄中……")
+    transcript, usage = transcribe(key, "gemini-3.6-flash", data, mime)
+    print(f"▶ 用量：輸入 {usage['input_tokens']:,} / 輸出 {usage['output_tokens']:,} tokens"
+          + (f"，估計 US${usage['usd']:.4f}" if usage.get("usd") is not None else ""))
 
     print("\n===== 逐字稿輸出 =====")
     print(transcript)
