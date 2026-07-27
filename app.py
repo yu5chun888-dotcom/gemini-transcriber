@@ -39,6 +39,13 @@ PRICING_USD_PER_1M = {
 USD_TO_TWD = 32.0          # 概略匯率，供快速換算參考
 AUDIO_TOKENS_PER_SEC = 25  # 實測值：5 秒音訊 = 125 tokens
 
+# 輸出 token 上限。⚠️ 必須明確指定：API 預設僅 8,192，50 分鐘錄音會在約 21 分處被截斷。
+# 65536 為 gemini-3.5/3.6-flash 的模型上限（以 client.models.get() 查得）。
+MAX_OUTPUT_TOKENS = 65536
+
+# 逐字稿約略耗用的輸出 token／每分鐘音訊（實測 21.8 分鐘 ≈ 8,165 tokens）
+OUTPUT_TOKENS_PER_MIN = 375
+
 TRANSCRIBE_PROMPT = """你是專業的逐字稿聽打員。請將這段音訊完整轉錄為逐字稿，並區分不同說話者（Speaker Diarization）。
 
 輸出規則（務必嚴格遵守）：
@@ -151,6 +158,14 @@ def extract_usage(response, model: str) -> dict:
     if price:
         usd = prompt / 1e6 * price["input"] + output / 1e6 * price["output"]
 
+    # 偵測是否因輸出額度用盡而被截斷（逐字稿會停在半句話）
+    truncated = False
+    try:
+        reason = getattr(response.candidates[0], "finish_reason", None)
+        truncated = getattr(reason, "name", str(reason)) == "MAX_TOKENS"
+    except Exception:
+        pass
+
     return {
         "input_tokens": prompt,
         "output_tokens": output,
@@ -158,6 +173,7 @@ def extract_usage(response, model: str) -> dict:
         "audio_tokens": audio,
         "usd": usd,
         "model": model,
+        "truncated": truncated,
     }
 
 
@@ -181,7 +197,8 @@ def transcribe(api_key: str, model: str, data: bytes, mime_type: str) -> tuple[s
         uploaded = wait_until_active(client, uploaded)
         contents = [TRANSCRIBE_PROMPT, uploaded]
 
-    response = client.models.generate_content(model=model, contents=contents)
+    config = types.GenerateContentConfig(max_output_tokens=MAX_OUTPUT_TOKENS)
+    response = client.models.generate_content(model=model, contents=contents, config=config)
     return (response.text or "").strip(), extract_usage(response, model)
 
 
@@ -242,11 +259,14 @@ if uploaded_file is not None:
         mime_type = MIME_MAP.get(ext, "audio/mp3")
         audio_bytes = uploaded_file.getvalue()
 
+        duration_sec = None
+
         if trim_enabled:
             with st.spinner("靜音裁剪中……"):
                 trimmed = trim_silence(audio_bytes, ext)
             if trimmed:
                 audio_bytes, mime_type, orig_sec, new_sec = trimmed
+                duration_sec = new_sec
                 saved_pct = max(0.0, (1 - new_sec / orig_sec) * 100) if orig_sec else 0.0
                 msg = (f"✂️ 已裁剪靜音：{orig_sec / 60:.1f} 分 → {new_sec / 60:.1f} 分"
                        f"（省 {saved_pct:.0f}%）")
@@ -259,6 +279,13 @@ if uploaded_file is not None:
             else:
                 st.caption("（未進行靜音裁剪：ffmpeg 不可用或處理失敗，改用原始音訊）")
 
+        # 事前預警：逐字稿長度可能撞到單次輸出上限
+        if duration_sec and duration_sec / 60 * OUTPUT_TOKENS_PER_MIN > MAX_OUTPUT_TOKENS * 0.8:
+            st.warning(
+                f"⚠️ 這段錄音長達 {duration_sec / 60:.0f} 分鐘，逐字稿可能超過模型單次輸出上限"
+                "而被截斷。建議先切成兩段再分別轉錄。"
+            )
+
         with st.spinner("AI 轉錄中……音訊越長耗時越久（10 分鐘錄音約需 1–3 分鐘），請勿關閉頁面。"):
             try:
                 transcript, usage = transcribe(api_key, model, audio_bytes, mime_type)
@@ -269,6 +296,12 @@ if uploaded_file is not None:
         if not transcript:
             st.warning("模型未回傳內容，請換一個模型或稍後再試。")
             st.stop()
+
+        if usage.get("truncated"):
+            st.error(
+                "⚠️ **逐字稿不完整**：內容長度已達模型單次輸出上限，後半段未產出"
+                "（最後一行會停在半句話）。請將錄音切成兩段後分別轉錄，再自行合併。"
+            )
 
         st.session_state["transcript"] = transcript
         st.session_state["transcript_name"] = uploaded_file.name
@@ -286,6 +319,8 @@ if "transcript" in st.session_state:
 
     usage = st.session_state.get("usage")
     if usage:
+        if usage.get("truncated"):
+            st.error("⚠️ 這份逐字稿因達到輸出上限而不完整，請將錄音切段後重新轉錄。")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("音訊長度", f"{usage['audio_tokens'] / AUDIO_TOKENS_PER_SEC / 60:.1f} 分")
         c2.metric("輸入 tokens", f"{usage['input_tokens']:,}")
