@@ -24,10 +24,6 @@ MODELS = {
 #（純文字仍可通、但任何長度的音訊都回 429），故需自動切換而非讓使用者卡住。
 FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.1-flash-lite"]
 
-# 503（伺服器暫時過載）時，同一模型的重試間隔（秒）。用盡後改試下一個模型。
-# 429（配額用盡）不重試——等待無用，直接換模型。
-RETRY_DELAYS_SEC = [5, 20]
-
 MIME_MAP = {
     "mp3": "audio/mp3",
     "wav": "audio/wav",
@@ -187,25 +183,16 @@ def extract_usage(response, model: str) -> dict:
 
 
 def is_quota_error(exc: Exception) -> bool:
-    """配額用盡（429）：等待無效，須改用其他模型。"""
+    """判斷是否為配額用盡（429）。"""
     return "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)
 
 
-def is_overload_error(exc: Exception) -> bool:
-    """伺服器暫時過載或異常（503／500／504）：稍候重試通常就會好。"""
-    s = str(exc)
-    return any(k in s for k in ("503", "UNAVAILABLE", "500 INTERNAL", "504", "DEADLINE_EXCEEDED"))
-
-
 def transcribe(api_key: str, model: str, data: bytes, mime_type: str,
-               on_fallback=None, on_retry=None) -> tuple[str, dict]:
+               on_fallback=None) -> tuple[str, dict]:
     """呼叫 Gemini API 進行轉錄與說話者識別。
 
-    首選 model。遇 503（暫時過載）先就地重試；遇 429（配額用盡）或重試無效時，
-    自動改用 FALLBACK_MODELS 依序嘗試。
-
-    on_fallback(failed_model, next_model)：切換模型前呼叫，供 UI 提示。
-    on_retry(model, wait_sec)：等待重試前呼叫，供 UI 提示。
+    首選 model；若該模型配額用盡（429），自動改用 FALLBACK_MODELS 依序重試。
+    on_fallback(failed_model, next_model) 會在每次切換前被呼叫，供 UI 提示。
 
     回傳 (逐字稿文字, 用量與費用估算)。
     """
@@ -228,33 +215,19 @@ def transcribe(api_key: str, model: str, data: bytes, mime_type: str,
 
     candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
     last_error: Exception | None = None
-
     for i, current in enumerate(candidates):
-        # 同一模型內：503 過載時就地重試
-        for attempt in range(len(RETRY_DELAYS_SEC) + 1):
-            try:
-                response = client.models.generate_content(
-                    model=current, contents=contents, config=config)
-                usage = extract_usage(response, current)
-                usage["fell_back_from"] = model if current != model else None
-                return (response.text or "").strip(), usage
-            except Exception as exc:
-                last_error = exc
-                if is_overload_error(exc) and attempt < len(RETRY_DELAYS_SEC):
-                    wait = RETRY_DELAYS_SEC[attempt]
-                    if on_retry:
-                        on_retry(current, wait)
-                    time.sleep(wait)
-                    continue
-                break  # 非暫時性錯誤，或重試已用盡 → 跳出改試下一個模型
-
-        # 這個模型不行了：只有配額／過載問題才值得換模型
-        if not (is_quota_error(last_error) or is_overload_error(last_error)):
-            raise last_error
-        if i == len(candidates) - 1:
-            raise last_error
-        if on_fallback:
-            on_fallback(current, candidates[i + 1])
+        try:
+            response = client.models.generate_content(
+                model=current, contents=contents, config=config)
+            usage = extract_usage(response, current)
+            usage["fell_back_from"] = model if current != model else None
+            return (response.text or "").strip(), usage
+        except Exception as exc:
+            last_error = exc
+            if not is_quota_error(exc) or i == len(candidates) - 1:
+                raise
+            if on_fallback:
+                on_fallback(current, candidates[i + 1])
 
     raise last_error  # pragma: no cover（迴圈必定 return 或 raise）
 
@@ -343,26 +316,19 @@ if uploaded_file is not None:
                 "而被截斷。建議先切成兩段再分別轉錄。"
             )
 
-        status_note = st.empty()
+        fallback_note = st.empty()
 
         def notify_fallback(failed: str, nxt: str):
-            status_note.warning(f"⚠️ `{failed}` 目前不可用，自動改用 `{nxt}` 繼續……")
-
-        def notify_retry(current: str, wait: int):
-            status_note.info(f"⏳ `{current}` 伺服器忙碌中，{wait} 秒後自動重試……")
+            fallback_note.warning(
+                f"⚠️ `{failed}` 今日配額已用盡，自動改用 `{nxt}` 繼續……"
+            )
 
         with st.spinner("AI 轉錄中……音訊越長耗時越久（10 分鐘錄音約需 1–3 分鐘），請勿關閉頁面。"):
             try:
                 transcript, usage = transcribe(api_key, model, audio_bytes, mime_type,
-                                               on_fallback=notify_fallback,
-                                               on_retry=notify_retry)
+                                               on_fallback=notify_fallback)
             except Exception as e:
-                if is_overload_error(e):
-                    st.error(
-                        "❌ **各模型伺服器都在忙**（503）。已自動重試並輪替所有備援模型仍未成功。\n\n"
-                        "這是 Google 端的暫時性壅塞，通常幾分鐘內恢復——請稍候再按一次「開始轉錄」。"
-                    )
-                elif is_quota_error(e):
+                if is_quota_error(e):
                     st.error(
                         "❌ **所有可用模型的配額都已用盡**（429）。\n\n"
                         "音訊轉錄配額通常隔日重置，請明天再試；"
@@ -372,7 +338,6 @@ if uploaded_file is not None:
                 else:
                     st.error(f"轉錄失敗：{e}")
                 st.stop()
-        status_note.empty()
 
         if not transcript:
             st.warning("模型未回傳內容，請換一個模型或稍後再試。")
