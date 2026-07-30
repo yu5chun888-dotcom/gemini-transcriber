@@ -15,9 +15,14 @@ from google.genai import types
 
 # ── 常數設定 ──────────────────────────────────────────────
 MODELS = {
+    "gemini-3.5-flash（穩定・推薦）": "gemini-3.5-flash",
     "gemini-3.6-flash（最新）": "gemini-3.6-flash",
-    "gemini-3.5-flash（穩定）": "gemini-3.5-flash",
 }
+
+# 遇到 429（配額用盡）時，依序改用這些模型重試。
+# 背景：2026-07-27 實測 gemini-3.6-flash 的音訊配額會先於 3.5-flash 用盡
+#（純文字仍可通、但任何長度的音訊都回 429），故需自動切換而非讓使用者卡住。
+FALLBACK_MODELS = ["gemini-3.5-flash", "gemini-3.6-flash", "gemini-3.1-flash-lite"]
 
 MIME_MAP = {
     "mp3": "audio/mp3",
@@ -177,8 +182,17 @@ def extract_usage(response, model: str) -> dict:
     }
 
 
-def transcribe(api_key: str, model: str, data: bytes, mime_type: str) -> tuple[str, dict]:
+def is_quota_error(exc: Exception) -> bool:
+    """判斷是否為配額用盡（429）。"""
+    return "429" in str(exc) or "RESOURCE_EXHAUSTED" in str(exc)
+
+
+def transcribe(api_key: str, model: str, data: bytes, mime_type: str,
+               on_fallback=None) -> tuple[str, dict]:
     """呼叫 Gemini API 進行轉錄與說話者識別。
+
+    首選 model；若該模型配額用盡（429），自動改用 FALLBACK_MODELS 依序重試。
+    on_fallback(failed_model, next_model) 會在每次切換前被呼叫，供 UI 提示。
 
     回傳 (逐字稿文字, 用量與費用估算)。
     """
@@ -189,7 +203,7 @@ def transcribe(api_key: str, model: str, data: bytes, mime_type: str) -> tuple[s
         audio_part = types.Part.from_bytes(data=data, mime_type=mime_type)
         contents = [TRANSCRIBE_PROMPT, audio_part]
     else:
-        # 大檔案：先上傳到 Files API，再引用
+        # 大檔案：先上傳到 Files API，再引用（只需上傳一次，各模型共用）
         uploaded = client.files.upload(
             file=io.BytesIO(data),
             config={"mime_type": mime_type},
@@ -198,8 +212,24 @@ def transcribe(api_key: str, model: str, data: bytes, mime_type: str) -> tuple[s
         contents = [TRANSCRIBE_PROMPT, uploaded]
 
     config = types.GenerateContentConfig(max_output_tokens=MAX_OUTPUT_TOKENS)
-    response = client.models.generate_content(model=model, contents=contents, config=config)
-    return (response.text or "").strip(), extract_usage(response, model)
+
+    candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_error: Exception | None = None
+    for i, current in enumerate(candidates):
+        try:
+            response = client.models.generate_content(
+                model=current, contents=contents, config=config)
+            usage = extract_usage(response, current)
+            usage["fell_back_from"] = model if current != model else None
+            return (response.text or "").strip(), usage
+        except Exception as exc:
+            last_error = exc
+            if not is_quota_error(exc) or i == len(candidates) - 1:
+                raise
+            if on_fallback:
+                on_fallback(current, candidates[i + 1])
+
+    raise last_error  # pragma: no cover（迴圈必定 return 或 raise）
 
 
 # ── 頁面 ──────────────────────────────────────────────────
@@ -286,11 +316,27 @@ if uploaded_file is not None:
                 "而被截斷。建議先切成兩段再分別轉錄。"
             )
 
+        fallback_note = st.empty()
+
+        def notify_fallback(failed: str, nxt: str):
+            fallback_note.warning(
+                f"⚠️ `{failed}` 今日配額已用盡，自動改用 `{nxt}` 繼續……"
+            )
+
         with st.spinner("AI 轉錄中……音訊越長耗時越久（10 分鐘錄音約需 1–3 分鐘），請勿關閉頁面。"):
             try:
-                transcript, usage = transcribe(api_key, model, audio_bytes, mime_type)
+                transcript, usage = transcribe(api_key, model, audio_bytes, mime_type,
+                                               on_fallback=notify_fallback)
             except Exception as e:
-                st.error(f"轉錄失敗：{e}")
+                if is_quota_error(e):
+                    st.error(
+                        "❌ **所有可用模型的配額都已用盡**（429）。\n\n"
+                        "音訊轉錄配額通常隔日重置，請明天再試；"
+                        "若急需，可到 [Google AI Studio](https://aistudio.google.com/) "
+                        "查看帳號配額或提升方案等級。"
+                    )
+                else:
+                    st.error(f"轉錄失敗：{e}")
                 st.stop()
 
         if not transcript:
@@ -326,6 +372,11 @@ if "transcript" in st.session_state:
         c2.metric("輸入 tokens", f"{usage['input_tokens']:,}")
         c3.metric("輸出 tokens", f"{usage['output_tokens']:,}",
                   help=f"含思考 token {usage['thoughts_tokens']:,}（一樣以輸出計價）")
+        if usage.get("fell_back_from"):
+            st.info(
+                f"ℹ️ 原選模型 `{usage['fell_back_from']}` 配額用盡，"
+                f"本次實際由 `{usage['model']}` 完成轉錄。"
+            )
         if usage.get("usd") is not None:
             c4.metric("本次費用", f"NT${usage['usd'] * USD_TO_TWD:.2f}",
                       help=f"US${usage['usd']:.4f}｜模型 {usage['model']}")
