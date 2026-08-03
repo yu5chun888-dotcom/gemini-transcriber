@@ -52,18 +52,78 @@ AUDIO_TOKENS_PER_SEC = 25  # 實測值：5 秒音訊 = 125 tokens
 # 65536 為 gemini-3.5/3.6-flash 的模型上限（以 client.models.get() 查得）。
 MAX_OUTPUT_TOKENS = 65536
 
+# 思考 token 與逐字稿正文共用上面的輸出額度。實測 48 分鐘錄音在不設限時，
+# 思考會吃掉約 62,000 token，導致正文只剩最後 4 分鐘且退化成無意義循環。
+# 設上限可把額度留給正文；實測 10 分鐘片段本來就只用約 4,300，故不影響短音訊。
+THINKING_BUDGET = 6144
+
 # 逐字稿約略耗用的輸出 token／每分鐘音訊（實測 21.8 分鐘 ≈ 8,165 tokens）
 OUTPUT_TOKENS_PER_MIN = 375
 
-TRANSCRIBE_PROMPT = """你是專業的逐字稿聽打員。請將這段音訊完整轉錄為逐字稿，並區分不同說話者（Speaker Diarization）。
+# 分段轉錄：實測同一提示詞在 10 分鐘片段可分出 4–5 軌、時間戳正常；
+# 但整份 53 分鐘只剩 2 軌、末段 5,605 字、時間戳停在 29:01（長音訊退化）。
+# 故超過門檻即切段分別轉錄再合併。
+CHUNK_MINUTES = 10
+CHUNK_THRESHOLD_MIN = 15   # 短於此長度不切，避免無謂的多次呼叫
 
-輸出規則（務必嚴格遵守）：
-1. 每個發言段落一行，格式為：[MM:SS] 說話者 A: 發言內容
-2. 時間戳記為該段發言的開始時間，格式 [分:秒]，超過一小時用 [HH:MM:SS]。
-3. 依出場順序將說話者命名為「說話者 A」「說話者 B」「說話者 C」……同一人全程使用同一代號。
-4. 逐字稿使用繁體中文。若說話者使用台語（台灣閩南語），請轉寫為語意對應的繁體中文書面文字，必要時可在括號內附註台語原詞；英文或專有名詞保留原文。
-5. 只輸出逐字稿本身，不要加任何前言、說明、標題或總結。
-"""
+# 提示詞規格來源：專案 07「08_逐字稿品質規格與驗收.md」§三
+# 每一條都對應該文件的驗收項目，修改前請先確認規格是否同步調整。
+PROMPT_TEMPLATE = """你是專業的會議逐字稿聽打員。請將這段錄音完整轉為逐字稿，嚴格遵守以下規格。
+
+【格式】
+1. 每段開頭標時間戳 [MM:SS]，超過一小時用 [HH:MM:SS]
+2. 依聲紋分軌標示「說話者 A」「說話者 B」「說話者 C」……{speaker_req}
+3. 同一個人連續發言為一段；**不同人發言必須換段換標籤**
+4. 單段不超過 400 字；超過時依語意或議題斷段，斷段後重新標時間戳與說話者
+5. 議題轉換處另起新段，不要把不同議題併在同一段
+6. 每段就是**一行純文字**，該行開頭必須是方括號時間戳，範例：
+   [12:34] 說話者 A: 發言內容
+7. **嚴禁任何格式標記**：不得使用 Markdown 項目符號（* 或 -）、粗體（**）、
+   HTML 標籤（如 <b>），也不得縮排。不要加摘要、標題或結論
+
+【台語處理】
+本會議台語比例高。**保留台語原詞，並在其後緊接括號國語對照**，例如：
+  厝（房子）、條仔（欄杆）、拜六（星期六）、按呢（這樣）、伊（他）、
+  頂高（上方）、甩掉（拆除）、無場（沒有位置）、齁（語助詞）
+所有台語詞一律加註，不得省略，也不得只寫國語而丟掉台語原音。
+英文與專有名詞保留原文。
+
+【禁止事項】
+1. 聽不清楚的地方標 [聽不清]，**不准憑空補字**
+2. 數字原音保留，不四捨五入、不換算單位（「四十五萬四」不可寫成「45 萬」）
+3. 不准把台語意譯後丟掉原音
+4. **不准把不同人的發言合併到同一個說話者標籤**
+5. 錄音後半段必須維持與前段相同的分段密度與分軌標準，不得因音訊變長而整段傾倒
+{term_block}"""
+
+DEFAULT_SPEAKER_REQ = "，至少分出 4 軌"
+
+# 製造業常見易錯詞的填寫範例（僅示範格式，實際詞表由使用者於側欄填入或存於 secrets）
+TERM_PLACEHOLDER = "易錯音→正確寫法，例如：\n浩森/豪昇→浩昇\n弘揚→鴻揚\n道具室→刀具室"
+
+
+def build_prompt(speaker_count: int = 0, term_table: str = "",
+                 context_tail: str = "") -> str:
+    """依使用者設定組出轉錄提示詞。
+
+    context_tail：分段轉錄時傳入前一段的結尾，讓說話者代號盡量延續。
+    """
+    if speaker_count >= 2:
+        speaker_req = f"。本場會議約有 {speaker_count} 位發言者，請至少分出 {speaker_count} 軌"
+    else:
+        speaker_req = DEFAULT_SPEAKER_REQ
+
+    term_block = ""
+    if term_table.strip():
+        term_block = ("\n\n【專有名詞校正】\n依以下對照表校正（左為易錯音，右為正確寫法）：\n"
+                      + term_table.strip())
+
+    if context_tail.strip():
+        term_block += ("\n\n【承接前段】\n這是同一場會議的後續片段。前一段結尾如下，"
+                       "請延續相同的說話者代號，並從 [00:00] 重新計時：\n"
+                       + context_tail.strip())
+
+    return PROMPT_TEMPLATE.format(speaker_req=speaker_req, term_block=term_block)
 
 
 # ── 靜音裁剪（省費用：Gemini 依音訊「秒數」計費，與檔案大小無關）──
@@ -123,16 +183,69 @@ def trim_silence(data: bytes, ext: str) -> tuple[bytes, str, float, float] | Non
         return None
 
 
+# ── 分段轉錄（長音訊退化的對策）──────────────────────────
+def split_audio(data: bytes, ext: str, chunk_sec: int) -> list[tuple[bytes, float]] | None:
+    """把音訊切成固定長度的段落。回傳 [(段落資料, 起始秒數), ...]。"""
+    ffmpeg = get_ffmpeg_path()
+    if not ffmpeg:
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, f"in.{ext}")
+            with open(src, "wb") as f:
+                f.write(data)
+            total = probe_duration(ffmpeg, src)
+            if not total:
+                return None
+
+            chunks = []
+            start = 0.0
+            while start < total:
+                dst = os.path.join(td, f"chunk_{int(start)}.mp3")
+                result = subprocess.run(
+                    [ffmpeg, "-y", "-ss", str(start), "-t", str(chunk_sec), "-i", src,
+                     "-ac", "1", "-b:a", "64k", dst],
+                    capture_output=True, timeout=1800,
+                )
+                if result.returncode != 0 or not os.path.exists(dst):
+                    return None
+                with open(dst, "rb") as f:
+                    chunks.append((f.read(), start))
+                start += chunk_sec
+        return chunks
+    except Exception:
+        return None
+
+
+def shift_timestamps(text: str, offset_sec: float) -> str:
+    """把逐字稿內的時間戳整體平移，讓分段結果能接回原始音訊時間軸。"""
+    def repl(m):
+        parts = [int(p) for p in m.group(1).split(":")]
+        sec = parts[0] * 60 + parts[1] if len(parts) == 2 else \
+            parts[0] * 3600 + parts[1] * 60 + parts[2]
+        sec += int(offset_sec)
+        h, rem = divmod(sec, 3600)
+        mnt, s = divmod(rem, 60)
+        return f"[{h}:{mnt:02d}:{s:02d}]" if h else f"[{mnt:02d}:{s:02d}]"
+
+    return re.sub(r"\[(\d{1,3}:\d{2}(?::\d{2})?)\]", repl, text)
+
+
 # ── 工具函式 ──────────────────────────────────────────────
-def get_api_key() -> str:
-    """依序從環境變數、Streamlit secrets 取得 API Key。"""
-    key = os.environ.get("GEMINI_API_KEY", "")
-    if not key:
+def get_secret(name: str, default: str = "") -> str:
+    """依序從環境變數、Streamlit secrets 取值；都沒有則回傳預設值。"""
+    value = os.environ.get(name, "")
+    if not value:
         try:
-            key = st.secrets["GEMINI_API_KEY"]
+            value = st.secrets[name]
         except Exception:
-            key = ""
-    return key
+            value = ""
+    return value or default
+
+
+def get_api_key() -> str:
+    """取得 Gemini API Key。"""
+    return get_secret("GEMINI_API_KEY")
 
 
 def wait_until_active(client: genai.Client, file, timeout_sec: int = 300):
@@ -198,7 +311,7 @@ def is_overload_error(exc: Exception) -> bool:
 
 
 def transcribe(api_key: str, model: str, data: bytes, mime_type: str,
-               on_fallback=None, on_retry=None) -> tuple[str, dict]:
+               on_fallback=None, on_retry=None, prompt: str = "") -> tuple[str, dict]:
     """呼叫 Gemini API 進行轉錄與說話者識別。
 
     首選 model。遇 503（暫時過載）先就地重試；遇 429（配額用盡）或重試無效時，
@@ -210,11 +323,12 @@ def transcribe(api_key: str, model: str, data: bytes, mime_type: str,
     回傳 (逐字稿文字, 用量與費用估算)。
     """
     client = genai.Client(api_key=api_key)
+    prompt = prompt or build_prompt()
 
     size_mb = len(data) / (1024 * 1024)
     if size_mb <= INLINE_LIMIT_MB:
         audio_part = types.Part.from_bytes(data=data, mime_type=mime_type)
-        contents = [TRANSCRIBE_PROMPT, audio_part]
+        contents = [prompt, audio_part]
     else:
         # 大檔案：先上傳到 Files API，再引用（只需上傳一次，各模型共用）
         uploaded = client.files.upload(
@@ -222,9 +336,12 @@ def transcribe(api_key: str, model: str, data: bytes, mime_type: str,
             config={"mime_type": mime_type},
         )
         uploaded = wait_until_active(client, uploaded)
-        contents = [TRANSCRIBE_PROMPT, uploaded]
+        contents = [prompt, uploaded]
 
-    config = types.GenerateContentConfig(max_output_tokens=MAX_OUTPUT_TOKENS)
+    config = types.GenerateContentConfig(
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+        thinking_config=types.ThinkingConfig(thinking_budget=THINKING_BUDGET),
+    )
 
     candidates = [model] + [m for m in FALLBACK_MODELS if m != model]
     last_error: Exception | None = None
@@ -259,6 +376,49 @@ def transcribe(api_key: str, model: str, data: bytes, mime_type: str,
     raise last_error  # pragma: no cover（迴圈必定 return 或 raise）
 
 
+def transcribe_chunked(api_key: str, model: str, data: bytes, mime_type: str,
+                       speaker_count: int, term_table: str, duration_sec: float,
+                       on_progress=None, **kw) -> tuple[str, dict]:
+    """長音訊分段轉錄後合併。短音訊則直接單次轉錄。"""
+    chunk_sec = CHUNK_MINUTES * 60
+    chunks = None
+    if duration_sec and duration_sec > CHUNK_THRESHOLD_MIN * 60:
+        ext = {"audio/mp3": "mp3", "audio/wav": "wav", "audio/mp4": "m4a"}.get(mime_type, "mp3")
+        chunks = split_audio(data, ext, chunk_sec)
+
+    if not chunks:
+        prompt = build_prompt(speaker_count, term_table)
+        return transcribe(api_key, model, data, mime_type, prompt=prompt, **kw)
+
+    parts, tail = [], ""
+    total = {"input_tokens": 0, "output_tokens": 0, "thoughts_tokens": 0,
+             "audio_tokens": 0, "usd": 0.0, "model": model,
+             "truncated": False, "fell_back_from": None, "chunks": len(chunks)}
+
+    for i, (chunk_data, offset) in enumerate(chunks):
+        if on_progress:
+            on_progress(i + 1, len(chunks))
+        prompt = build_prompt(speaker_count, term_table, context_tail=tail)
+        text, usage = transcribe(api_key, model, chunk_data, "audio/mp3",
+                                 prompt=prompt, **kw)
+        parts.append(shift_timestamps(text, offset))
+
+        # 取本段結尾數行，作為下一段的說話者延續線索
+        lines = [l for l in text.splitlines() if l.strip()]
+        tail = "\n".join(lines[-3:])
+
+        for k in ("input_tokens", "output_tokens", "thoughts_tokens", "audio_tokens"):
+            total[k] += usage.get(k, 0)
+        if usage.get("usd"):
+            total["usd"] += usage["usd"]
+        total["truncated"] = total["truncated"] or usage.get("truncated", False)
+        total["model"] = usage.get("model", model)
+        if usage.get("fell_back_from"):
+            total["fell_back_from"] = usage["fell_back_from"]
+
+    return "\n".join(parts), total
+
+
 # ── 頁面 ──────────────────────────────────────────────────
 st.set_page_config(page_title="錄音轉逐字稿", page_icon="🎙️", layout="wide")
 
@@ -276,6 +436,21 @@ with st.sidebar:
         help="Gemini 依音訊秒數計費，與檔案大小無關。自動剪掉超過 1 秒的靜音段，"
              "長錄音通常可省 2 成以上費用。注意：裁剪後時間戳記是裁剪版音訊的時間，"
              "與原始錄音會有偏移；需要精準對回原檔時請關閉此選項。",
+    )
+
+    speaker_count = st.number_input(
+        "與會人數（0 = 自動）",
+        min_value=0, max_value=12, value=0, step=1,
+        help="填入實際發言人數可大幅改善說話者分軌。留 0 則要求模型至少分出 4 軌。",
+    )
+
+    term_table = st.text_area(
+        "專有名詞校正表（選填）",
+        value=get_secret("TERM_TABLE"),
+        height=120,
+        placeholder=TERM_PLACEHOLDER,
+        help="每行一組「易錯音→正確寫法」。可消除廠商名、部門名、製程術語的誤植。"
+             "常用詞表可存到 Streamlit Secrets 的 TERM_TABLE，即會自動帶入。",
     )
 
     api_key = get_api_key()
@@ -336,6 +511,16 @@ if uploaded_file is not None:
             else:
                 st.caption("（未進行靜音裁剪：ffmpeg 不可用或處理失敗，改用原始音訊）")
 
+        if duration_sec is None:
+            # 未裁剪或裁剪失敗時仍需知道長度，才能判斷是否要分段轉錄
+            ffmpeg = get_ffmpeg_path()
+            if ffmpeg:
+                with tempfile.TemporaryDirectory() as td:
+                    probe_path = os.path.join(td, f"probe.{ext}")
+                    with open(probe_path, "wb") as f:
+                        f.write(audio_bytes)
+                    duration_sec = probe_duration(ffmpeg, probe_path)
+
         # 事前預警：逐字稿長度可能撞到單次輸出上限
         if duration_sec and duration_sec / 60 * OUTPUT_TOKENS_PER_MIN > MAX_OUTPUT_TOKENS * 0.8:
             st.warning(
@@ -351,11 +536,17 @@ if uploaded_file is not None:
         def notify_retry(current: str, wait: int):
             status_note.info(f"⏳ `{current}` 伺服器忙碌中，{wait} 秒後自動重試……")
 
+        def notify_progress(i: int, n: int):
+            status_note.info(f"🎧 分段轉錄中……第 {i}/{n} 段（長錄音切段可避免說話者分軌退化）")
+
         with st.spinner("AI 轉錄中……音訊越長耗時越久（10 分鐘錄音約需 1–3 分鐘），請勿關閉頁面。"):
             try:
-                transcript, usage = transcribe(api_key, model, audio_bytes, mime_type,
-                                               on_fallback=notify_fallback,
-                                               on_retry=notify_retry)
+                transcript, usage = transcribe_chunked(
+                    api_key, model, audio_bytes, mime_type,
+                    speaker_count=int(speaker_count), term_table=term_table,
+                    duration_sec=duration_sec or 0,
+                    on_progress=notify_progress,
+                    on_fallback=notify_fallback, on_retry=notify_retry)
             except Exception as e:
                 if is_overload_error(e):
                     st.error(
